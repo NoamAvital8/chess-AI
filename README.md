@@ -64,6 +64,58 @@ when resuming. The replay buffer and optimizer state are stored in the checkpoin
 - Training samples recent games from a replay buffer and saves resumable optimizer,
   network, RNG and replay states after each iteration.
 
+
+## Replay the first game with `--record`
+
+Use `--record` to capture only **game 1 of this command**, even when training runs
+multiple games or iterations. Once game 1 finishes, a Lichess analysis URL is
+printed immediately, a `.pgn` file is saved, and **training continues normally**.
+No video encoding, external upload, or API account is required:
+
+```powershell
+python chess_ai.py --resume --iterations 3 --games 2 --simulations 8 --max-plies 200 --steps 16 --record
+```
+
+For example, a recording would produce:
+
+```text
+Recorded first game (123 plies). PGN: C:\...\recordings\selfplay_iteration_5_game_1.pgn
+Watch/replay on Lichess: https://lichess.org/analysis/pgn/1._e4_e5_2._Nf3_...
+Iteration 5, game 1/2: 1-0, 123 plies
+...
+Iteration 5, game 2/2: ...
+```
+
+Open the printed Lichess link to step through all of the moves and analyze them.
+The complete sequence is encoded in the URL: it is **not a hosted/archived game**.
+Because browsers limit URL lengths, extremely long games use the PGN fallback.
+To see one on **Chess.com**, open https://www.chess.com/analysis and import
+the saved `.pgn` file (Chess.com does not expose a documented direct-PGN URL).
+Set `--record-dir my_records` to change the output directory.
+
+### Optional: export an MP4 too
+
+MP4 encoding takes additional time; install the optional packages and use:
+
+```powershell
+python -m pip install -r requirements-video.txt
+python chess_ai.py --resume --iterations 1 --games 4 --simulations 8 --record-video
+```
+
+This does everything `--record` does **and** saves the first game's board as an
+MP4 under `recordings/` (one frame per half-move, including the starting board).
+Use `--video-fps 3` for faster playback. Board pieces use letters inside disks
+(`N` = knight, `K` = king).
+
+**Chess rules:** Games use `python-chess` legal moves and `board.outcome(claim_draw=True)`.
+That covers checkmate, stalemate, insufficient material, threefold repetition,
+claimable 50-move draw, automatic fivefold/75-move draws, castling, promotion,
+and en passant (a capture, **not** a draw condition).
+
+**Move-cap caveat:** Currently, unfinished games at `--max-plies` are treated as
+draws in the training targets (a simplification we plan to improve). The exported
+PGN instead correctly uses `Result "*"` for these unfinished games.
+
 ## Testing
 
 ```powershell
