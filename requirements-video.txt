@@ -1,0 +1,4 @@
+-r requirements.txt
+Pillow>=10,<13
+imageio>=2.34,<3
+imageio-ffmpeg>=0.5,<1
