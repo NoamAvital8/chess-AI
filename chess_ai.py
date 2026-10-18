@@ -18,6 +18,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from checkpoint_access import single_writer
+from engine_opponent import START_RANDOMNESS, Stockfish, adapt_randomness, find_stockfish
 from rules import game_outcome
 
 PIECES = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
@@ -406,25 +407,52 @@ def endgame_start(rng: np.random.Generator) -> tuple[chess.Board, str]:
             return board, name
 
 
-def is_endgame_game(number: int, fraction: float) -> bool:
+def _count(number: int, fraction: float) -> int:
+    # The epsilon keeps shares such as 0.25 / 0.75 exact despite float rounding.
+    return math.floor(number * fraction + 1e-9)
+
+
+def evenly_spread(number: int, fraction: float) -> bool:
     """Spread a fraction of games evenly over the run's global game numbers."""
-    return math.floor((number + 1) * fraction) > math.floor(number * fraction)
+    return _count(number + 1, fraction) > _count(number, fraction)
+
+
+def game_kind(number: int, endgame_fraction: float,
+              stockfish_fraction: float) -> tuple[str, int]:
+    """The kind of the run's game ``number`` and how many earlier games had that kind.
+
+    Endgame and Stockfish games each take their share, spread evenly over the run.
+    """
+    if evenly_spread(number, endgame_fraction):
+        return "endgame", _count(number, endgame_fraction)
+    index = number - _count(number, endgame_fraction)  # position among the other games
+    share = min(1.0, stockfish_fraction / (1 - endgame_fraction)) if endgame_fraction < 1 else 0.0
+    if evenly_spread(index, share):
+        return "stockfish", _count(index, share)
+    return "standard", index - _count(index, share)
 
 
 def self_play_steps(network, simulations: int, max_plies: int, rng: np.random.Generator,
                     *, board: chess.Board | None = None,
                     recorded_moves: list[chess.Move] | None = None,
-                    game_info: dict | None = None):
-    """One self-play game as a generator of search requests; see ``run_batched``."""
+                    game_info: dict | None = None, opponent=None,
+                    model_color: chess.Color = chess.WHITE):
+    """One self-play game as a generator of search requests; see ``run_batched``.
+
+    With ``opponent`` (a function from board to move), the opponent plays the side
+    that is not ``model_color``. Both sides' positions are still searched, so every
+    training target comes from the model's own search, never from the opponent.
+    """
     board = chess.Board() if board is None else board.copy()
     positions = []
     while len(positions) < max_plies and terminal_value(board) is None:
         result = yield from search_steps(board, network, simulations, noise=True, rng=rng)
         positions.append((encode(board), move_indices(board, result.moves),
                           result.policy.astype(np.float32), board.turn))
-        board.push(result.move)
+        move = result.move if opponent is None or board.turn == model_color else opponent(board)
+        board.push(move)
         if recorded_moves is not None:
-            recorded_moves.append(result.move)
+            recorded_moves.append(move)
 
     outcome = game_outcome(board)
     # An unfinished game has no observed value target. Keep its search-policy targets.
@@ -562,7 +590,8 @@ def save_checkpoint(path: Path, network: PolicyValueNet, optimizer: torch.optim.
                     iteration: int, replay: deque, rng: np.random.Generator,
                     sampler: random.Random, width: int, blocks: int,
                     config: dict | None = None, human_replay: deque | None = None,
-                    human_games: int = 0, origin_snapshot: str | None = None) -> None:
+                    human_games: int = 0, origin_snapshot: str | None = None,
+                    stockfish_randomness: float | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
     torch.save({"network": network.state_dict(), "optimizer": optimizer.state_dict(),
@@ -570,7 +599,8 @@ def save_checkpoint(path: Path, network: PolicyValueNet, optimizer: torch.optim.
                 "sampler": sampler.getstate(), "torch_rng": torch.get_rng_state(),
                 "width": width, "blocks": blocks, "format_version": FORMAT_VERSION,
                 "config": config, "human_replay": list(human_replay or []),
-                "human_games": human_games, "origin_snapshot": origin_snapshot}, temp)
+                "human_games": human_games, "origin_snapshot": origin_snapshot,
+                "stockfish_randomness": stockfish_randomness}, temp)
     os.replace(temp, path)
 
 
@@ -602,12 +632,39 @@ def load_checkpoint(path: Path, network: PolicyValueNet, optimizer: torch.optim.
         human_replay.extend(data.get("human_replay", []))
     if metadata is not None:
         metadata.update(human_games=data.get("human_games", 0),
-                        origin_snapshot=data.get("origin_snapshot"))
+                        origin_snapshot=data.get("origin_snapshot"),
+                        stockfish_randomness=data.get("stockfish_randomness"))
     return data["iteration"], deque(data["replay"], maxlen=replay_size)
+
+
+def model_score(result: str, model_color: chess.Color) -> float | None:
+    """1 for a model win, 0.5 for a draw, 0 for a loss; None for an unfinished game."""
+    if result == "1/2-1/2":
+        return 0.5
+    if result in ("1-0", "0-1"):
+        return float((result == "1-0") == (model_color == chess.WHITE))
+    return None
 
 
 @single_writer
 def run(args: argparse.Namespace) -> None:
+    """Train; owns the optional Stockfish process for sparring games and evaluation."""
+    setting = getattr(args, "stockfish", "auto")
+    fraction = getattr(args, "stockfish_fraction", 0.25)
+    wanted = fraction > 0 or getattr(args, "eval_every", 10) > 0
+    path = find_stockfish(setting) if wanted else None
+    if path is None and setting.lower() == "auto" and fraction > 0:
+        print("Stockfish not found: training without Stockfish games "
+              "(install it, or pass --stockfish PATH or --stockfish none).", flush=True)
+    engine = Stockfish(path, getattr(args, "stockfish_depth", 1)) if path else None
+    try:
+        _run(args, engine)
+    finally:
+        if engine is not None:
+            engine.close()
+
+
+def _run(args: argparse.Namespace, engine: Stockfish | None) -> None:
     from training_metrics import MetricsWriter, replay_summary
 
     if args.simulations < 1 or args.max_plies < 1 or args.batch_size < 1 or args.steps < 1:
@@ -623,10 +680,18 @@ def run(args: argparse.Namespace) -> None:
     human_fraction = getattr(args, "human_fraction", 0.25)
     human_replay_size = getattr(args, "human_replay_size", 5000)
     endgame_fraction = getattr(args, "endgame_fraction", 0.25)
+    stockfish_fraction = getattr(args, "stockfish_fraction", 0.25)
+    eval_stockfish_randomness = getattr(args, "eval_stockfish_randomness", 0.75)
     if not 0 <= human_fraction <= 1 or human_replay_size < 1:
         raise ValueError("human-fraction must be between 0 and 1; human-replay-size must be positive")
-    if not 0 <= endgame_fraction <= 1:
-        raise ValueError("endgame-fraction must be between 0 and 1")
+    if not 0 <= endgame_fraction <= 1 or not 0 <= stockfish_fraction <= 1:
+        raise ValueError("endgame-fraction and stockfish-fraction must be between 0 and 1")
+    if endgame_fraction + stockfish_fraction > 1:
+        raise ValueError("endgame-fraction plus stockfish-fraction must be at most 1")
+    if not 0 <= eval_stockfish_randomness <= 1:
+        raise ValueError("eval-stockfish-randomness must be between 0 and 1")
+    if engine is None:
+        stockfish_fraction = 0.0
     if eval_every < 0 or eval_games < 2 or eval_games % 2:
         raise ValueError("eval-every must be >= 0 and eval-games must be even and >= 2")
     if eval_simulations < 1 or eval_max_plies < 1:
@@ -663,7 +728,7 @@ def run(args: argparse.Namespace) -> None:
     optimizer = make_optimizer(network, args.lr or 0.001)
     replay = deque(maxlen=args.replay_size)
     human_replay = deque(maxlen=human_replay_size)
-    metadata = {"human_games": 0, "origin_snapshot": None}
+    metadata = {"human_games": 0, "origin_snapshot": None, "stockfish_randomness": None}
     start = 0
     if args.resume:
         start, replay = load_checkpoint(path, network, optimizer, device,
@@ -678,7 +743,12 @@ def run(args: argparse.Namespace) -> None:
               "eval_games": eval_games, "eval_simulations": eval_simulations,
               "eval_max_plies": eval_max_plies, "eval_seed": eval_seed,
               "human_fraction": human_fraction, "human_replay_size": human_replay_size,
-              "endgame_fraction": endgame_fraction, "format_version": FORMAT_VERSION}
+              "endgame_fraction": endgame_fraction, "format_version": FORMAT_VERSION,
+              "stockfish_path": engine.path if engine else None,
+              "stockfish_fraction": stockfish_fraction,
+              "eval_stockfish_randomness": eval_stockfish_randomness}
+    if metadata["stockfish_randomness"] is None:
+        metadata["stockfish_randomness"] = START_RANDOMNESS
     metrics_path = Path(getattr(args, "metrics_file", None) or checkpoint_dir / "metrics.jsonl")
     metrics = MetricsWriter(metrics_path)
     snapshot_dir = checkpoint_dir / "snapshots" / metrics.run_id
@@ -701,28 +771,46 @@ def run(args: argparse.Namespace) -> None:
         iteration_started = time.perf_counter()
         selfplay_started = iteration_started
         tasks, game_infos, record, record_game = [], [], None, None
+        randomness = metadata["stockfish_randomness"]
         for game in range(args.games):
-            board, start_name = None, "standard"
-            if is_endgame_game((iteration - 1) * args.games + game, endgame_fraction):
+            board, start_name, opponent, model_color = None, "standard", None, chess.WHITE
+            kind, ordinal = game_kind((iteration - 1) * args.games + game, endgame_fraction,
+                                      stockfish_fraction)
+            if kind == "endgame":
                 board, start_name = endgame_start(rng)
+            elif kind == "stockfish":
+                start_name, model_color = "stockfish", ordinal % 2 == 0
+                player, token = engine.player(randomness), object()
+
+                def opponent(position, player=player, token=token):
+                    return player.choose_move(position, rng, token)
             moves = None
             # Record the command's first game from the standard starting position.
             if ((args.record or args.record_video) and not recorded_once
-                    and record_game is None and board is None):
+                    and record_game is None and kind == "standard"):
                 record = moves = []
                 record_game = game
             game_info = {"start": start_name}
             if board is not None:
                 game_info["start_fen"] = board.fen()
+            if opponent is not None:
+                game_info.update(model_color="white" if model_color else "black",
+                                 stockfish_randomness=randomness)
             game_infos.append(game_info)
             tasks.append(self_play_steps(network, args.simulations, args.max_plies, rng,
                                          board=board, recorded_moves=moves,
-                                         game_info=game_info))
+                                         game_info=game_info, opponent=opponent,
+                                         model_color=model_color))
         games_played = run_batched(tasks, device)
         selfplay_seconds = time.perf_counter() - selfplay_started
-        results = {}
+        results, stockfish_scores = {}, []
         for game, ((samples, result), game_info) in enumerate(zip(games_played, game_infos)):
             game_seconds = game_info.pop("finished") - selfplay_started
+            if game_info["start"] == "stockfish":
+                score = model_score(result, game_info["model_color"] == "white")
+                game_info["model_score"] = score
+                if score is not None:
+                    stockfish_scores.append(score)
             metrics.write("self_play_game", iteration=iteration, game=game + 1,
                           **game_info, seconds=game_seconds,
                           positions_per_second=len(samples) / max(game_seconds, 1e-9))
@@ -748,9 +836,17 @@ def run(args: argparse.Namespace) -> None:
                 recorded_once = True
             replay.extend(samples)
             results[result] = results.get(result, 0) + 1
-            start_text = "" if game_info["start"] == "standard" else f" from {game_info['start']}"
+            if game_info["start"] == "standard":
+                start_text = ""
+            elif game_info["start"] == "stockfish":
+                start_text = (f" vs stockfish@{randomness:.2f} "
+                              f"(model {game_info['model_color']})")
+            else:
+                start_text = f" from {game_info['start']}"
             print(f"Iteration {iteration}, game {game + 1}/{args.games}{start_text}: {result}, "
                   f"{len(samples)} plies", flush=True)
+        # Harder opponent after model wins, easier after losses; saved with the checkpoint.
+        metadata["stockfish_randomness"] = adapt_randomness(randomness, stockfish_scores)
         train_started = time.perf_counter()
         train_stats = {}
         p_loss, _ = learn(network, optimizer, replay, device,
@@ -761,7 +857,8 @@ def run(args: argparse.Namespace) -> None:
         save_checkpoint(path, network, optimizer, iteration, replay, rng, sampler,
                         width, blocks, config=config, human_replay=human_replay,
                         human_games=metadata["human_games"],
-                        origin_snapshot=metadata["origin_snapshot"])
+                        origin_snapshot=metadata["origin_snapshot"],
+                        stockfish_randomness=metadata["stockfish_randomness"])
         snapshot = snapshot_dir / f"iteration_{iteration:06d}.pt"
         save_snapshot(snapshot, network, iteration, width, blocks)
         save_seconds = time.perf_counter() - save_started
@@ -770,7 +867,11 @@ def run(args: argparse.Namespace) -> None:
         metrics.write("training_iteration", iteration=iteration, games=results,
                       capped_games=capped, capped_game_rate=capped / args.games,
                       completed_games=args.games - capped, generated_positions=total_plies,
-                      endgame_games=sum(info["start"] != "standard" for info in game_infos),
+                      endgame_games=sum(info["start"] in ENDGAMES for info in game_infos),
+                      stockfish_games=sum(info["start"] == "stockfish" for info in game_infos),
+                      stockfish_score=(float(np.mean(stockfish_scores))
+                                       if stockfish_scores else None),
+                      stockfish_randomness=metadata["stockfish_randomness"],
                       average_game_plies=total_plies / args.games,
                       positions_per_second=total_plies / max(selfplay_seconds, 1e-9),
                       self_play_seconds=selfplay_seconds, training_seconds=train_seconds,
@@ -783,6 +884,11 @@ def run(args: argparse.Namespace) -> None:
               f"policy_loss={p_loss:.4f}, value_loss={value_text}, "
               f"capped={capped}/{args.games}, {total_plies / max(selfplay_seconds, 1e-9):.1f} "
               f"positions/s; saved {path}", flush=True)
+        if stockfish_fraction:
+            score_text = f"{np.mean(stockfish_scores):.2f}" if stockfish_scores else "n/a"
+            print(f"Stockfish randomness {randomness:.2f} -> "
+                  f"{metadata['stockfish_randomness']:.2f} (model score {score_text} "
+                  f"in {len(stockfish_scores)} finished games)", flush=True)
         if eval_every and iteration % eval_every == 0:
             from evaluation import evaluate, load_opponent
 
@@ -793,9 +899,17 @@ def run(args: argparse.Namespace) -> None:
             references.setdefault(previous_snapshot.resolve(), "previous")
             for reference in eval_checkpoints:
                 references.setdefault(reference.resolve(), f"checkpoint:{reference.name}")
-            for reference, label in [(None, "random"), *references.items()]:
+            opponents = [(None, "random"), *references.items()]
+            if engine is not None:
+                # A fixed-strength yardstick, comparable across iterations and runs.
+                player = engine.player(eval_stockfish_randomness)
+                opponents.append((player, player.label))
+            for reference, label in opponents:
                 eval_started = time.perf_counter()
-                opponent = load_opponent(reference, device) if reference else None
+                if isinstance(reference, Path):
+                    opponent = load_opponent(reference, device)
+                else:
+                    opponent, reference = reference, None
                 scores = evaluate(network, opponent, device, eval_games, eval_simulations,
                                   eval_max_plies, eval_seed)
                 metrics.write("evaluation", iteration=iteration, opponent=label,
@@ -823,6 +937,13 @@ def main() -> None:
     parser.add_argument("--max-plies", type=int, default=300)
     parser.add_argument("--endgame-fraction", type=float, default=0.25,
                         help="share of self-play games started from random simple endgames")
+    parser.add_argument("--stockfish", default="auto",
+                        help="Stockfish executable for sparring and evaluation: a path, auto "
+                             "(search PATH and winget installs) or none")
+    parser.add_argument("--stockfish-fraction", type=float, default=0.25,
+                        help="share of self-play games against weakened Stockfish")
+    parser.add_argument("--stockfish-depth", type=int, default=1,
+                        help="Stockfish search depth when it plays its own move")
     parser.add_argument("--steps", type=int, default=32, help="gradient updates per iteration")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--replay-size", type=int, default=50000)
@@ -848,6 +969,8 @@ def main() -> None:
     parser.add_argument("--eval-max-plies", type=int, default=400,
                         help="evaluation move cap after each fixed opening")
     parser.add_argument("--eval-seed", type=int, default=2026)
+    parser.add_argument("--eval-stockfish-randomness", type=float, default=0.75,
+                        help="fixed share of random moves for the Stockfish evaluation opponent")
     parser.add_argument("--eval-checkpoint", action="append", default=[],
                         help="trusted older .pt file to evaluate too; may be repeated")
     parser.add_argument("--record", action="store_true",

@@ -182,7 +182,7 @@ def test_completed_games_learn_persist_resume_and_survive_selfplay(monkeypatch, 
                   human_fraction=0.25, seed=1, device="cpu", threads=1,
                   checkpoint_dir=str(tmp_path / "human"), width=8, blocks=0,
                   lr=None, resume=True, temperature_moves=1,
-                  record=False, record_video=False, eval_every=0))
+                  record=False, record_video=False, eval_every=0, stockfish="none"))
     data = torch.load(checkpoint, weights_only=False)
     assert data["human_games"] == 3 and len(data["human_replay"]) == 12
     rows = [json.loads(line) for line in (tmp_path / "human" / "metrics.jsonl").read_text().splitlines()]
@@ -236,7 +236,7 @@ def test_default_commands_update_one_shared_model(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["chess_ai.py", "--resume", "--iterations", "1",
                                      "--games", "1", "--simulations", "1", "--max-plies", "1",
                                      "--steps", "1", "--batch-size", "8", "--threads", "1",
-                                     "--eval-every", "0"])
+                                     "--eval-every", "0", "--stockfish", "none"])
     chess_ai.main()
     after_selfplay = torch.load(shared, weights_only=False)
     assert after_selfplay["human_games"] == 1 and len(after_selfplay["human_replay"]) == 4

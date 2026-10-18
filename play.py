@@ -236,7 +236,7 @@ def run(args: argparse.Namespace, *, input_fn=None, output=print,
     optimizer = make_optimizer(network, args.lr)
     rng, sampler = np.random.default_rng(args.seed), random.Random(args.seed)
     human_replay = deque(maxlen=args.human_replay_size)
-    metadata = {"human_games": 0, "origin_snapshot": None}
+    metadata = {"human_games": 0, "origin_snapshot": None, "stockfish_randomness": None}
     if "optimizer" in data:
         del data
         iteration, replay = load_checkpoint(source, network, optimizer, device, args.replay_size,
@@ -330,7 +330,8 @@ def run(args: argparse.Namespace, *, input_fn=None, output=print,
         save_checkpoint(checkpoint, network, optimizer, iteration, replay, rng, sampler,
                         width, blocks, config=config, human_replay=human_replay,
                         human_games=metadata["human_games"],
-                        origin_snapshot=metadata["origin_snapshot"])
+                        origin_snapshot=metadata["origin_snapshot"],
+                        stockfish_randomness=metadata["stockfish_randomness"])
         snapshot = snapshots / f"after_game_{metadata['human_games']:06d}.pt"
         save_snapshot(snapshot, network, iteration, width, blocks)
         metrics.write("human_checkpoint", human_games=metadata["human_games"],

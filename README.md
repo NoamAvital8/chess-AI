@@ -35,8 +35,9 @@ python chess_ai.py --iterations 10
 ```
 
 Defaults: 8 self-play games per iteration (played concurrently), 16 simulations per
-move, a 64-channel × 4-block network, 32 updates of batch size 64, and a quarter of the
-games started from simple endgames. On a CPU, `--threads 4` usually helps; lower
+move, a 64-channel × 4-block network, 32 updates of batch size 64, a quarter of the
+games started from simple endgames and a quarter played against weakened Stockfish
+(when it is installed; see below). On a CPU, `--threads 4` usually helps; lower
 `--simulations`, `--width` or `--blocks` for speed. More simulations give better search
 targets but **fewer games per hour**.
 `--max-plies` (default 300) stops overlong games as **unfinished**, keeping their policy
@@ -98,11 +99,36 @@ that `play.py` and `chess_ai.py` keep sharing the default `checkpoints/latest.pt
   either colour stronger. Checkmates happen there quickly, so the value head sees
   decisive results early. Their labels are still real game outcomes. The share is spread
   evenly over the run, and logs record each game's start.
+- **Stockfish sparring partner:** see the next section.
 - **Batched self-play:** all games of an iteration run together, and their search
   leaves are evaluated in one network call per step. Evaluation games are batched the
   same way.
 - Training uses AdamW and a vectorised policy loss. Replay stores compact uint8 board
   planes. Each iteration saves resumable optimizer, network, RNG and replay states.
+
+## Sparring against weakened Stockfish
+
+Self-play between two copies of a weak model mostly ends in draws, which gives the
+value head little to learn from. A quarter of the games (`--stockfish-fraction 0.25`)
+are therefore played against [Stockfish](https://stockfishchess.org/), weakened so
+that the model wins about half of them:
+
+- On each of its turns, the opponent plays a uniformly random legal move with
+  probability *randomness*, and otherwise Stockfish's move at `--stockfish-depth`
+  (default 1).
+- After each finished game, the randomness drops by 0.025 if the model won and rises
+  by 0.025 if it lost. It starts at 0.9 and is saved in the checkpoint, so it keeps
+  adapting across resumed runs. A falling value means the model is getting stronger.
+- The model plays White and Black alternately. Both sides' positions are searched
+  by the model, as in human play, so **every training target still comes from the
+  model's own search and the actual game results**. Stockfish's moves are never used
+  as targets.
+
+`--stockfish auto` (the default) looks for `stockfish` on `PATH` and then for a winget
+install, for example after `winget install Stockfish.Stockfish`. Pass a path to the
+executable, or `--stockfish none` to train without it. If Stockfish isn't found, the
+trainer says so and plays those games as ordinary self-play. Each iteration logs and
+prints the randomness and the model's score against Stockfish.
 
 ## Evaluation and training metrics
 
@@ -118,6 +144,9 @@ fixed openings, both colours) against:
   anchor that stays the same across resumed sessions.
 - `session_start`: the model at the start of this invocation, when that differs.
 - `previous`: the preceding iteration's model, when that differs.
+- `stockfish@0.75`: Stockfish with a **fixed** randomness
+  (`--eval-stockfish-randomness`, default 0.75). It's a yardstick that stays the same
+  across iterations and runs; the iteration-51 model scored about 0.43 against it.
 
 Games use fixed opening pairs with colors swapped, a separate fixed evaluation
 seed, deterministic search moves, and no exploration noise. Both neural players use the

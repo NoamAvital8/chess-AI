@@ -35,14 +35,17 @@ def load_opponent(path: Path, device: torch.device) -> PolicyValueNet:
     return network.to(device).eval()
 
 
-def play_game_steps(candidate: PolicyValueNet, opponent: PolicyValueNet | None,
-                    candidate_color: chess.Color, simulations: int, max_plies: int,
-                    opening: tuple[str, ...], seed: int):
-    """One evaluation game as a generator of search requests (see ``run_batched``)."""
+def play_game_steps(candidate: PolicyValueNet, opponent, candidate_color: chess.Color,
+                    simulations: int, max_plies: int, opening: tuple[str, ...], seed: int):
+    """One evaluation game as a generator of search requests (see ``run_batched``).
+
+    ``opponent`` is a network, ``None`` for uniformly random moves, or a player with
+    ``choose_move(board, rng, game)`` such as a weakened Stockfish.
+    """
     board = chess.Board()
     for uci in opening:
         board.push_uci(uci)
-    rng = np.random.default_rng(seed)
+    rng, game = np.random.default_rng(seed), object()
     played = 0
     # max_plies counts moves after the fixed opening, equally for both colors.
     while played < max_plies and game_outcome(board) is None:
@@ -50,6 +53,8 @@ def play_game_steps(candidate: PolicyValueNet, opponent: PolicyValueNet | None,
         if player is None:
             legal = list(board.legal_moves)
             move = legal[int(rng.integers(len(legal)))]
+        elif hasattr(player, "choose_move"):
+            move = player.choose_move(board, rng, game)
         else:
             move = (yield from search_steps(board, player, simulations, noise=False)).move
         board.push(move)
@@ -80,7 +85,7 @@ def evaluate(candidate: PolicyValueNet, opponent: PolicyValueNet | None,
         raise ValueError("evaluation games must be a positive even number (>= 2)")
     if simulations < 1 or max_plies < 1:
         raise ValueError("evaluation simulations and max-plies must be positive")
-    models = [candidate] + ([opponent] if opponent is not None else [])
+    models = [model for model in (candidate, opponent) if isinstance(model, torch.nn.Module)]
     modes = [model.training for model in models]
     try:
         for model in models:

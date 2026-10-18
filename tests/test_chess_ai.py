@@ -220,7 +220,7 @@ def test_policy_loss_matches_per_example_reference():
 
 
 def test_endgame_starts_are_legal_unfinished_and_reproducible():
-    from chess_ai import ENDGAMES, endgame_start, is_endgame_game
+    from chess_ai import ENDGAMES, endgame_start, evenly_spread
 
     first = [endgame_start(np.random.default_rng(5)) for _ in range(2)]
     assert first[0][0].fen() == first[1][0].fen()
@@ -233,9 +233,32 @@ def test_endgame_starts_are_legal_unfinished_and_reproducible():
         assert len(board.piece_map()) == 2 + len(ENDGAMES[name])
         assert not board.castling_rights and board.ep_square is None
     assert names == set(ENDGAMES)
-    assert [is_endgame_game(n, .25) for n in range(8)] == [False, False, False, True] * 2
-    assert not any(is_endgame_game(n, 0) for n in range(10))
-    assert all(is_endgame_game(n, 1) for n in range(10))
+    assert [evenly_spread(n, .25) for n in range(8)] == [False, False, False, True] * 2
+    assert not any(evenly_spread(n, 0) for n in range(10))
+    assert all(evenly_spread(n, 1) for n in range(10))
+
+
+def test_game_kinds_share_the_run_without_overlap():
+    from chess_ai import game_kind
+
+    kinds = [game_kind(n, .25, .25) for n in range(800)]
+    names = [kind for kind, _ in kinds]
+    assert names[:8] == ["standard", "standard", "stockfish", "endgame",
+                         "standard", "standard", "stockfish", "endgame"]
+    assert names.count("endgame") == names.count("stockfish") == 200
+    # Ordinals count each kind separately, so Stockfish games alternate model colours.
+    assert [ordinal for kind, ordinal in kinds if kind == "stockfish"][:4] == [0, 1, 2, 3]
+    assert all(kind == "standard" for kind, _ in (game_kind(n, 0, 0) for n in range(20)))
+    assert all(kind == "stockfish" for kind, _ in (game_kind(n, 0, 1) for n in range(20)))
+
+
+def test_stockfish_randomness_adapts_towards_an_even_score():
+    from engine_opponent import RANDOMNESS_STEP, adapt_randomness
+
+    assert adapt_randomness(.5, [1.0]) == pytest.approx(.5 - RANDOMNESS_STEP / 2)  # win: harder
+    assert adapt_randomness(.5, [0.0]) == pytest.approx(.5 + RANDOMNESS_STEP / 2)  # loss: easier
+    assert adapt_randomness(.5, [.5, 1.0, 0.0]) == pytest.approx(.5)
+    assert adapt_randomness(.99, [0.0] * 5) == 1.0 and adapt_randomness(.01, [1.0] * 5) == 0.0
 
 
 def test_self_play_from_endgame_start_records_actual_outcome():
@@ -280,7 +303,7 @@ def run_args(tmp_path, **overrides):
                   checkpoint_dir=str(tmp_path / "ckpt"), width=8, blocks=1, lr=0.001,
                   resume=False, record=False, record_video=False,
                   record_dir=str(tmp_path / "recordings"), video_fps=2.0, eval_every=0,
-                  endgame_fraction=0.0)
+                  endgame_fraction=0.0, stockfish="none")
     values.update(overrides)
     return Namespace(**values)
 
@@ -523,3 +546,120 @@ def test_resume_appends_metrics_and_honors_explicit_learning_rate(tmp_path):
     args.resume = False
     with pytest.raises(FileExistsError, match="resume"):
         run(args)
+
+
+class FakeStockfish:
+    """Stands in for the engine: its own move is always the first legal move in UCI order."""
+    instances = []
+
+    def __init__(self, path, depth=1):
+        self.path, self.depth, self.closed, self.calls = path, depth, False, 0
+        FakeStockfish.instances.append(self)
+
+    def player(self, randomness):
+        from engine_opponent import StockfishPlayer
+        return StockfishPlayer(self, randomness)
+
+    def best_move(self, board, game):
+        self.calls += 1
+        return min(board.legal_moves, key=lambda move: move.uci())
+
+    def close(self):
+        self.closed = True
+
+
+def test_opponent_games_search_both_sides_but_play_the_opponents_moves():
+    from chess_ai import self_play_steps, run_batched
+
+    model = PolicyValueNet(width=8, blocks=0)
+    played = []
+
+    def opponent(board):
+        move = min(board.legal_moves, key=lambda move: move.uci())
+        played.append((board.ply(), move))
+        return move
+
+    moves, info = [], {}
+    examples, _ = run_batched([self_play_steps(model, 2, 6, np.random.default_rng(2),
+                                               recorded_moves=moves, game_info=info,
+                                               opponent=opponent, model_color=chess.BLACK)],
+                              torch.device("cpu"))[0]
+    assert len(examples) == len(moves) == 6  # every position has a search target
+    assert [ply for ply, _ in played] == [0, 2, 4]  # the opponent plays White
+    assert all(moves[ply] == move for ply, move in played)
+
+
+def test_training_with_stockfish_games_adapts_and_evaluates(monkeypatch, tmp_path):
+    import json
+    import chess_ai
+    from chess_ai import run
+
+    FakeStockfish.instances.clear()
+    monkeypatch.setattr(chess_ai, "find_stockfish", lambda setting: "fake-stockfish.exe")
+    monkeypatch.setattr(chess_ai, "Stockfish", FakeStockfish)
+    args = run_args(tmp_path, games=4, iterations=2, max_plies=4, stockfish="auto",
+                    stockfish_fraction=0.5, eval_every=2, eval_games=2, eval_simulations=1,
+                    eval_max_plies=2)
+    run(args)
+    engine = FakeStockfish.instances[0]
+    assert engine.closed  # the engine process is shut down after training
+    records = [json.loads(line) for line in
+               (tmp_path / "ckpt" / "metrics.jsonl").read_text().splitlines()]
+    games = [row for row in records if row["event"] == "self_play_game"]
+    sparring = [row for row in games if row["start"] == "stockfish"]
+    assert len(sparring) == 4 and [row["model_color"] for row in sparring] == ["white", "black"] * 2
+    assert all(row["stockfish_randomness"] == 0.9 for row in sparring[:2])
+    iterations = [row for row in records if row["event"] == "training_iteration"]
+    assert all(row["stockfish_games"] == 2 for row in iterations)
+    labels = [row["opponent"] for row in records if row["event"] == "evaluation"]
+    assert labels[-1] == "stockfish@0.75"
+    saved = torch.load(tmp_path / "ckpt" / "latest.pt", weights_only=False)
+    assert saved["stockfish_randomness"] == iterations[-1]["stockfish_randomness"]
+    # Resuming continues from the saved randomness.
+    args.resume, args.iterations = True, 1
+    run(args)
+    rows = [json.loads(line) for line in
+            (tmp_path / "ckpt" / "metrics.jsonl").read_text().splitlines()]
+    resumed = [row for row in rows if row["event"] == "self_play_game"][-4:]
+    assert {row["stockfish_randomness"] for row in resumed if row["start"] == "stockfish"} == {
+        saved["stockfish_randomness"]}
+
+
+def test_missing_stockfish_falls_back_to_plain_self_play(monkeypatch, tmp_path, capsys):
+    import chess_ai
+    from chess_ai import run
+
+    monkeypatch.setattr(chess_ai, "find_stockfish", lambda setting: None)
+    run(run_args(tmp_path, iterations=1, stockfish="auto", stockfish_fraction=0.5))
+    assert "Stockfish not found" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="at most 1"):
+        run(run_args(tmp_path / "other", endgame_fraction=.75, stockfish_fraction=.5))
+
+
+def test_evaluation_against_a_move_choosing_player():
+    import evaluation
+    from engine_opponent import StockfishPlayer
+
+    engine = FakeStockfish("fake")
+    candidate = PolicyValueNet(8, 0).train()
+    scores = evaluation.evaluate(candidate, StockfishPlayer(engine, 0.0), torch.device("cpu"),
+                                 2, 1, 6, 4)
+    assert scores["games"] == 2 and engine.calls > 0 and candidate.training
+
+
+@pytest.mark.skipif(__import__("engine_opponent").find_stockfish() is None,
+                    reason="Stockfish is not installed")
+def test_real_stockfish_plays_legal_reproducible_moves():
+    from engine_opponent import Stockfish, find_stockfish
+
+    engine = Stockfish(find_stockfish())
+    try:
+        board = chess.Board("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1")
+        player = engine.player(0.0)
+        first = player.choose_move(board, np.random.default_rng(1), object())
+        assert first == chess.Move.from_uci("a1a8")  # depth 1 still finds mate in one
+        assert player.choose_move(board, np.random.default_rng(1), object()) == first
+        random_move = engine.player(1.0).choose_move(board, np.random.default_rng(1), object())
+        assert random_move in board.legal_moves
+    finally:
+        engine.close()
