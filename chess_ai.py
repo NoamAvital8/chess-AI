@@ -166,7 +166,8 @@ def choose_move(moves: list[chess.Move], pi: np.ndarray, temperature: float,
 
 def self_play(network: PolicyValueNet, device: torch.device, simulations: int,
               max_plies: int, temperature_moves: int,
-              rng: np.random.Generator) -> tuple[list[tuple], str]:
+              rng: np.random.Generator,
+              recorded_moves: list[chess.Move] | None = None) -> tuple[list[tuple], str]:
     board = chess.Board()
     positions = []
     for ply in range(max_plies):
@@ -178,6 +179,8 @@ def self_play(network: PolicyValueNet, device: torch.device, simulations: int,
                                                    dtype=np.int64), pi.astype(np.float32), board.turn))
         selected = choose_move(moves, pi, 1.0 if ply < temperature_moves else 0.0, rng)
         board.push(selected)
+        if recorded_moves is not None:
+            recorded_moves.append(selected)
 
     outcome = board.outcome(claim_draw=True)
     # Artificial move cap is a draw; increase max_plies to reduce this bias.
@@ -271,11 +274,33 @@ def run(args: argparse.Namespace) -> None:
                                         args.replay_size, rng, sampler)
         print(f"Resumed after iteration {start} ({len(replay)} stored positions)", flush=True)
     print(f"Training on {device}, width={width}, blocks={blocks}", flush=True)
+    recorded_once = False
     for iteration in range(start + 1, start + args.iterations + 1):
         results = {}
         for game in range(args.games):
+            record = [] if (args.record or args.record_video) and not recorded_once else None
             samples, result = self_play(network, device, args.simulations, args.max_plies,
-                                        args.temperature_moves, rng)
+                                        args.temperature_moves, rng, recorded_moves=record)
+            if record is not None:
+                from recording import lichess_url, write_pgn
+                output_dir = Path(args.record_dir)
+                stem = f"selfplay_iteration_{iteration}_game_{game + 1}"
+                pgn_path = output_dir / (stem + ".pgn")
+                write_pgn(record, pgn_path)
+                print(f"Recorded first game ({len(record)} plies). PGN: {pgn_path.resolve()}", flush=True)
+                if record:
+                    url = lichess_url(record)
+                    if len(url) <= 2000:
+                        print(f"Watch/replay on Lichess: {url}", flush=True)
+                    else:
+                        print("Game is too long for a reliable replay URL. Import the "
+                              f"PGN above at https://www.chess.com/analysis", flush=True)
+                if args.record_video:
+                    from recording import write_mp4
+                    video_path = output_dir / (stem + ".mp4")
+                    write_mp4(record, video_path, fps=args.video_fps)
+                    print(f"Video saved: {video_path.resolve()}", flush=True)
+                recorded_once = True
             replay.extend(samples)
             results[result] = results.get(result, 0) + 1
             print(f"Iteration {iteration}, game {game + 1}/{args.games}: {result}, "
@@ -305,6 +330,14 @@ def main() -> None:
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--record", action="store_true",
+                        help="save first self-play game as PGN and print a Lichess replay link")
+    parser.add_argument("--record-video", action="store_true",
+                        help="also save first game as MP4 (requires optional video dependencies)")
+    parser.add_argument("--record-dir", "--video-dir", dest="record_dir", default="recordings",
+                        help="directory for recorded PGN/MP4 files")
+    parser.add_argument("--video-fps", type=float, default=2.0,
+                        help="video frames per second (one frame per half-move)")
     run(parser.parse_args())
 
 
