@@ -67,3 +67,45 @@ def test_self_play_train_and_resume(tmp_path):
                                            np.random.default_rng(), random.Random())
     assert iteration == 1 and len(restored) == 4
     assert all(torch.equal(a, b) for a, b in zip(model.parameters(), clone.parameters()))
+
+def test_record_moves_pgn_and_lichess_link(tmp_path):
+    import chess.pgn
+    from recording import lichess_url, write_pgn
+
+    board = chess.Board()
+    moves = []
+    for san in ("e4", "e5", "Nf3", "Nc6"):
+        move = board.parse_san(san)
+        moves.append(move)
+        board.push(move)
+    path = tmp_path / "first.pgn"
+    assert write_pgn(moves, path) == "*"  # unfinished != official draw
+    with path.open(encoding="utf8") as source:
+        saved = chess.pgn.read_game(source)
+    assert list(saved.mainline_moves()) == moves
+    assert saved.headers["Result"] == "*"
+    assert "1._e4_e5_2._Nf3_Nc6" in lichess_url(moves)
+    assert lichess_url(moves).startswith("https://lichess.org/analysis/pgn/")
+
+
+def test_record_only_first_game_during_multi_game_run(tmp_path, capsys):
+    from argparse import Namespace
+    from chess_ai import run
+    import chess.pgn
+
+    args = Namespace(simulations=1, max_plies=2, batch_size=2, steps=1,
+                     games=2, iterations=2, replay_size=40, seed=1,
+                     device="cpu", threads=1, checkpoint_dir=str(tmp_path / "ckpt"),
+                     width=8, blocks=1, lr=0.001, resume=False,
+                     temperature_moves=1, record=True, record_video=False,
+                     record_dir=str(tmp_path / "recordings"), video_fps=2.0)
+    run(args)
+    pgns = list((tmp_path / "recordings").glob("*.pgn"))
+    assert len(pgns) == 1
+    assert "iteration_1_game_1" in pgns[0].name
+    with pgns[0].open(encoding="utf-8") as stream:
+        game = chess.pgn.read_game(stream)
+    assert len(list(game.mainline_moves())) == 2
+    output = capsys.readouterr().out
+    assert output.count("Watch/replay on Lichess:") == 1
+    assert "Iteration 2, game 2/2" in output
