@@ -9,6 +9,8 @@ from urllib.parse import quote
 import chess
 import chess.pgn
 
+from rules import game_outcome
+
 BOARD_LEFT = 64
 BOARD_TOP = 76
 SQUARE = 80
@@ -16,13 +18,17 @@ FRAME_W = 768
 FRAME_H = 832
 
 
-def write_pgn(moves: Sequence[chess.Move], path: Path) -> str:
+def write_pgn(moves: Sequence[chess.Move], path: Path, *,
+              result_override: str | None = None, termination: str | None = None,
+              headers: dict[str, str] | None = None) -> str:
     """Save exact played moves; a training move cap is NOT an official draw."""
     path.parent.mkdir(parents=True, exist_ok=True)
     game = chess.pgn.Game()
     game.headers["Event"] = "Chess AI self-play"
     game.headers["White"] = "Shared neural network"
     game.headers["Black"] = "Shared neural network"
+    if headers:
+        game.headers.update(headers)
     board = chess.Board()
     node = game
     for move in moves:
@@ -30,9 +36,18 @@ def write_pgn(moves: Sequence[chess.Move], path: Path) -> str:
             raise ValueError(f"Illegal recorded move: {move.uci()} in {board.fen()}")
         node = node.add_variation(move)
         board.push(move)
-    result = board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "*"
+    outcome = game_outcome(board)
+    result = outcome.result() if outcome is not None else "*"
+    if result_override is not None:
+        if result_override not in ("1-0", "0-1", "1/2-1/2", "*"):
+            raise ValueError("Invalid PGN result")
+        if result != "*" and result_override != result:
+            raise ValueError("PGN result contradicts the board's completed outcome")
+        result = result_override
     game.headers["Result"] = result
-    if result == "*":
+    if termination is not None:
+        game.headers["Termination"] = termination
+    elif result == "*":
         game.headers["Termination"] = "Unfinished (training move cap)"
     with path.open("w", encoding="utf-8") as stream:
         print(game, file=stream, end="\n\n")
@@ -127,7 +142,8 @@ def write_mp4(moves: Sequence[chess.Move], path: Path, fps: float = 2.0) -> None
         if move not in final.legal_moves:
             raise ValueError(f"Illegal recorded move: {move.uci()}")
         final.push(move)
-    result = final.result(claim_draw=True) if final.is_game_over(claim_draw=True) else "* (move cap)"
+    outcome = game_outcome(final)
+    result = outcome.result() if outcome is not None else "* (move cap)"
     with imageio.get_writer(str(path), fps=fps, codec="libx264", quality=7,
                             macro_block_size=16, output_params=["-pix_fmt", "yuv420p"]) as writer:
         writer.append_data(np.asarray(_frame(board, None, 0, "", result)))
